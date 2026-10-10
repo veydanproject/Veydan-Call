@@ -1,0 +1,65 @@
+# VCall: the call node of Veydan Chat: STUN, TURN and the SFU for groups.
+# Anybody may run one, as with the VLink bridge.
+#
+#   vcall-proto    the control protocol: HELLO/WELCOME, TURN credentials,
+#                  rooms, and the report a node makes to the registry
+#   vcall          the node, and the tools to try one (id, probe, room-test, ctl)
+#
+# Who a node is (its id, the TLS pin) is not made up here: it is the same as
+# for a bridge, the crate vlink-proto of VLink, next to this folder (../link).
+# In the node's own repository the path becomes a git dependency on the
+# public VLink at a tag, as it is for the hub.
+[workspace]
+resolver = "2"
+members = ["crates/vcall-proto", "crates/vcall"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+publish = false
+authors = ["Veydan Project"]
+# PolyForm Perimeter 1.0.1, as the whole project: LICENSE is a copy of the
+# monorepo's, here because this folder becomes the root of a repository.
+license-file = "LICENSE"
+
+[workspace.dependencies]
+vcall-proto = { path = "crates/vcall-proto" }
+vlink-proto = { git = "https://github.com/veydanproject/Veydan-Link", tag = "v0.2.1" }
+
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+h2 = "0.4"
+http = "1"
+# The long-term credential key of STUN is MD5(user:realm:password), RFC 8489
+# 9.2.2; ring has no MD5. It keys an HMAC only, nothing is signed with it.
+md-5 = "0.10"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The SFU socket's buffers (SO_SNDBUF, SO_RCVBUF): tokio has no way to set
+# them, and tokio itself brings this crate.
+socket2 = "0.6"
+# The SFU: ICE, DTLS, SRTP, RTP and SCTP without a media pipeline; in RTP
+# mode it hands packets over as they are, which is all a forwarder needs.
+# The crypto backend is the pure-Rust one: the release is a static musl
+# binary built with zig, and a C library of its own would be one more
+# thing to cross-build.
+str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util", "fs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "ansi"] }
+# The registry is reached over HTTPS with the bundled roots, as the bridge does it.
+webpki-roots = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"

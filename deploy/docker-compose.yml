@@ -1,0 +1,54 @@
+# A VCall node in one command, on any Linux server with docker, a public
+# IPv4 address and UDP open:
+#
+#   curl -fsSLO https://raw.githubusercontent.com/veydanproject/Veydan-Call/main/deploy/docker-compose.yml
+#   echo "VCALL_PUBLIC_IP=<the public address of this server>" > .env
+#   docker compose up -d
+#
+# The node makes its own key on the first start and keeps it in the volume
+# `vcall` (back it up: the key is the node's identity). It is listed for
+# everybody once the registry has checked that it answers. Open in the
+# firewall: 443/tcp, 3478/tcp, 3478/udp, 3479/tcp, 3479/udp and the relay
+# ports 49152-65535/udp.
+#
+#   docker compose logs -f          what it does
+#   docker compose exec vcall /vcall id --addr <ip>:443    its reference
+#   docker compose pull && docker compose up -d     the newest release
+#
+# The settings below are the defaults; uncomment one to change it.
+services:
+  vcall:
+    image: rookbeam/vcall:latest
+    container_name: vcall
+    restart: unless-stopped
+    # The node listens on the server's own address: the relay ports are
+    # many, and it must see the real address of every caller.
+    network_mode: host
+    volumes:
+      - vcall:/data
+    environment:
+      # The public address of this server: what the node tells callers to
+      # reach it at. Required (from .env).
+      VCALL_PUBLIC_IP: ${VCALL_PUBLIC_IP:?set VCALL_PUBLIC_IP in .env to the public IPv4 address of this server}
+      # The registry that lists public nodes. Leave it: it is the Veydan one.
+      VCALL_REGISTRY: ${VCALL_REGISTRY:-https://eu-1-vpush.veydan.net/vlink}
+      # A hint where the node is: eu, us, asia, ru…
+      VCALL_REGION: ${VCALL_REGION:-}
+      # Where it listens (443: what looks like a web server from outside).
+      # VCALL_LISTEN: 0.0.0.0:443
+      # The relay ports, when the firewall allows another range.
+      # VCALL_RELAY_PORTS: 49152-65535
+      # A private node: only the people with an access key or an invitation.
+      # VCALL_PRIVATE: "true"
+      # How much the node may carry in all, in megabits per second.
+      # VCALL_MAX_MBPS: "100"
+      # warn, info, debug
+      # VCALL_LOG: info
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  vcall:

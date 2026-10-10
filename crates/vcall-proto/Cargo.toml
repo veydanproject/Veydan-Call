@@ -1,0 +1,21 @@
+[package]
+name = "vcall-proto"
+description = "VCall: what a client and a call node say to each other over the control channel, and what a node tells the registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+license-file.workspace = true
+
+[dependencies]
+# The envelope of a signed list and the delegation of the list key are
+# the bridges' (`vlink_proto::list`): a node checks the registry's list of
+# nodes as a client checks its list of bridges, under a context of its own.
+vlink-proto = { workspace = true }
+# Ed25519 and SHA-256: a report to the registry is signed by the node's
+# key, and the registry checks it against the node's id.
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

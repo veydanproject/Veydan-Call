@@ -1,0 +1,65 @@
+[Unit]
+Description=VCall node (STUN, TURN, SFU)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=vcall
+Group=vcall
+# Control and TURN over TLS on 443; STUN and TURN over UDP and TCP on 3478;
+# the SFU over UDP and TCP on 3479; relayed traffic leaves from the ports
+# VCALL_RELAY_PORTS names. On a server where 443 is taken by a web server,
+# vcall.env moves VCALL_LISTEN. A public node names its registry there
+# (VCALL_REGISTRY, VCALL_REGION).
+Environment=VCALL_LISTEN=0.0.0.0:443
+Environment=VCALL_TURN_LISTEN=0.0.0.0:3478
+Environment=VCALL_SFU_LISTEN=0.0.0.0:3479
+Environment=VCALL_DATA=/opt/vcall/data
+Environment=VCALL_CTL=/run/vcall/ctl.sock
+# The port, the public address, the limits and the like, when they differ.
+EnvironmentFile=-/opt/vcall/etc/vcall.env
+ExecStart=/opt/vcall/bin/vcall node
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+
+# The node's key and TURN secret are for the node alone.
+UMask=0077
+
+# /run/vcall, where the control socket lives: whoever is in the group may
+# ask `vcall ctl stats`.
+RuntimeDirectory=vcall
+RuntimeDirectoryMode=0750
+
+# The node needs the network, one directory and, for a port below 1024,
+# the right to bind it. Nothing else of the machine.
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths=/opt/vcall/data
+# Every TURN allocation is a socket; the SFU over TCP is a socket a participant.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,42 @@
+[package]
+name = "vcall"
+description = "VCall node: STUN, TURN and the SFU for Veydan Chat calls, and the tools to try one"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+license-file.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vcall"
+path = "src/main.rs"
+
+[dependencies]
+vcall-proto = { workspace = true }
+vlink-proto = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+h2 = { workspace = true }
+http = { workspace = true }
+md-5 = { workspace = true }
+rcgen = { workspace = true }
+ring = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+socket2 = { workspace = true }
+str0m = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+webpki-roots = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

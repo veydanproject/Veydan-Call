@@ -1,0 +1,9 @@
+# The one version of Rust this workspace builds with: rustup reads the file
+# on a developer's machine, and the workflows in .github/ install what it
+# names, so a new stable with new lints never reaches CI before it reaches
+# the tree. To move: change the version, run clippy with -D warnings, fix
+# what the new version finds, commit together.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["clippy"]

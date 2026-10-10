@@ -1,0 +1,11 @@
+/target/
+/dist/
+/.tools/
+# Keys a bridge makes when it is run from this folder.
+/data/
+/run/
+*.key
+*.pem
+*.env
+# zig leaves it in the working directory of a cross build
+.intentionally-empty-file.o
