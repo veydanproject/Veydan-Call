@@ -31,7 +31,7 @@ services:
       # reach it at. Required (from .env).
       VCALL_PUBLIC_IP: ${VCALL_PUBLIC_IP:?set VCALL_PUBLIC_IP in .env to the public IPv4 address of this server}
       # The registry that lists public nodes. Leave it: it is the Veydan one.
-      VCALL_REGISTRY: ${VCALL_REGISTRY:-https://eu-1-vpush.veydan.net/vlink}
+      VCALL_REGISTRY: ${VCALL_REGISTRY:-https://hub.veydan.net/vlink}
       # A hint where the node is: eu, us, asia, ru…
       VCALL_REGION: ${VCALL_REGION:-}
       # Where it listens (443: what looks like a web server from outside).

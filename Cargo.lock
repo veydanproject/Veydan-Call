@@ -1735,7 +1735,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcall"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "vcall-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ring",
  "serde",
@@ -1779,8 +1779,8 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vlink-proto"
-version = "0.2.1"
-source = "git+https://github.com/veydanproject/Veydan-Link?tag=v0.2.1#070d12154696c6aad0667bc3bc8998ac4d46c13f"
+version = "0.3.1"
+source = "git+https://github.com/veydanproject/Veydan-Link?tag=v0.3.1#7f1ccc019c06b43c9320dd794b2709c535d0e764"
 dependencies = [
  "bytes",
  "h2",

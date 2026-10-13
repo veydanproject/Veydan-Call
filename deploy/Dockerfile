@@ -7,9 +7,14 @@
 # (VCALL_RELAY_PORTS), and mapping thousands of ports one by one is slow
 # and easy to get wrong.
 #
-# The image holds one static binary, its licence and the notices of the
-# crates it is built from, nothing else: no shell, no system. /data keeps
+# The image holds two static binaries, their licence and the notices of the
+# crates they are built from, nothing else: no shell, no system. /data keeps
 # the node's key; with the volume gone, the node comes back as another node.
+#
+# The second binary is the agent of the project's monitoring, off unless the
+# volunteer turns it on (-e VEYDAN_AGENT=on, README.md, "Project
+# monitoring"). It is the first process: without the switch it hands the
+# process over to the node at once, so the node runs exactly as alone.
 FROM scratch
 LABEL org.opencontainers.image.title="VCall" \
       org.opencontainers.image.description="The VCall node: STUN and TURN for Veydan Chat calls" \
@@ -22,8 +27,12 @@ COPY LICENSE /LICENSE
 # The notices of the crates the binary is built from.
 COPY THIRD-PARTY-LICENSES.md /THIRD-PARTY-LICENSES.md
 COPY dist/vcall /vcall
+# The agent: the image build takes it from the kit of the project's
+# servers (make image VAGENT=<file>; the release passes the build of each
+# architecture).
+COPY dist/vagent /vagent
 ENV VCALL_DATA=/data VCALL_LISTEN=0.0.0.0:443 VCALL_TURN_LISTEN=0.0.0.0:3478 VCALL_CTL=/data/ctl.sock
 VOLUME /data
 EXPOSE 443/tcp 3478/tcp 3478/udp
-ENTRYPOINT ["/vcall"]
+ENTRYPOINT ["/vagent", "entrypoint", "/vcall"]
 CMD ["node"]

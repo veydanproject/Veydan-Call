@@ -1,5 +1,27 @@
 # VCall
 
+## Support the Veydan network
+
+You can support the Veydan network by installing **Veydan Link** (a bridge)
+and **Veydan Call** (a call node) on a server of yours. One command, as
+root, on a server with a public IPv4 address, best of all inside the
+country whose people you want to help:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/veydanproject/Veydan-Server/main/install.sh | sudo bash -s -- --volunteer
+```
+
+It installs both as services of the system, without docker, and they join
+the network by themselves: nothing to configure, no domain, no account.
+The bridge gives people in a country that closes the way to Veydan a way
+in; the call node makes the calls of people near it fast. Neither can read
+anything of anyone. The call node alone: `--call` instead of
+`--volunteer`; the bridge is [Veydan-Link](https://github.com/veydanproject/Veydan-Link).
+What each of them needs, what the command does to the server and how to
+see that it works is below.
+
+## What it is
+
 A **call node** for Veydan Chat: the server part of a voice or video call.
 Calls go directly between the two people whenever they can; when a network
 is in the way, the node relays the packets (TURN). A group meets in a room
@@ -22,49 +44,148 @@ Anybody may run a node, as anybody may run a VLink bridge. A private node
 (`VCALL_PRIVATE=true`) serves only the people you give an access key or an
 invitation to; a team can run one for itself.
 
-## Run one
+## What you need
 
-A server with a public IPv4 address, port 443 free, and UDP open:
+- A server with a public IPv4 address. A node helps the people **near
+  it**: a call is fast when the node is close to the callers, so a node
+  inside a country helps the people of that country most.
+- These ports open from the Internet: one TCP port for control and TURN
+  over TLS, 3478 and 3479 (UDP and TCP), and a range of UDP ports for the
+  relayed calls. UDP must not be blocked by your provider.
+- Bandwidth: one relayed call may take up to two megabits a second each
+  way. The node limits itself (`VCALL_MAX_MBPS`, 100 by default); a
+  provider that counts traffic will count this.
+- Linux, and the right to run a command as root. No domain, no certificate.
 
+## Install
+
+Two ways. Both give the same node; take the one you are used to.
+
+### As a service of the system (no docker)
+
+One command, as root:
+
+```sh
+# a call node and a VLink bridge on one server: what helps people in a
+# country that closes the way to Veydan most
+curl -fsSL https://raw.githubusercontent.com/veydanproject/Veydan-Server/main/install.sh | sudo bash -s -- --volunteer
+
+# a call node alone
+curl -fsSL https://raw.githubusercontent.com/veydanproject/Veydan-Server/main/install.sh | sudo bash -s -- --call
 ```
+
+It asks the public address of the server (Enter keeps the one it found),
+the control port (Enter keeps 8443) and a word for where the node is
+(`eu`, `us`, `ru`, …; a hint for the apps, Enter keeps `default`); with
+`--volunteer` also the two questions of the bridge. Without questions: add
+`--yes`.
+
+What it does to the server, all of it:
+
+1. installs a few small packages it needs itself (`curl`, `jq`,
+   `openssl`, `ufw` and the like);
+2. downloads `vcall` for this machine (x86_64 or aarch64) from the
+   [releases](https://github.com/veydanproject/Veydan-Call/releases) of this
+   repository and checks it against `SHA256SUMS`;
+3. puts it in `/opt/vcall` under a user of its own, `vcall`, with a
+   systemd unit; the settings are in `/opt/vcall/etc/vcall.env`;
+4. turns the firewall `ufw` on with ssh and the node's ports open and the
+   rest closed. If the server already serves something else, keep the
+   firewall as it is: put a file `server.conf` with the line
+   `FIREWALL=none` in the directory you run the command from;
+5. keeps its answers in `/opt/veydan/server.conf`, so that the same
+   command, run again, asks nothing;
+6. starts the node, tells the registry of the Veydan network about it and
+   prints its reference, `<ip>:8443#<id>`.
+
+It is tested on Debian 13; any Linux with systemd should do. The installer
+is the kit [Veydan-Server](https://github.com/veydanproject/Veydan-Server),
+which you can read before you run it.
+
+The ports the installer opens, to open at your provider as well:
+**8443/tcp**, **3478/udp**, **3478/tcp**, **3479/udp**, **3479/tcp**,
+**49152–49999/udp**.
+
+By hand: the binary from the releases, `deploy/vcall.service`, the binary
+in `/opt/vcall/bin/vcall`, the key and the other files of `VCALL_DATA` in
+`/opt/vcall/data`, settings in `/opt/vcall/etc/vcall.env`.
+
+### In docker
+
+```sh
+docker run -d --name vcall --restart=unless-stopped --network=host -v vcall:/data \
+  -e VCALL_PUBLIC_IP=<your-ip> -e VCALL_REGISTRY=https://hub.veydan.net/vlink rookbeam/vcall
+```
+
+or with compose (`deploy/docker-compose.yml`: the image, the volume, host
+networking, the Veydan registry and every setting as a comment):
+
+```sh
 curl -fsSLO https://raw.githubusercontent.com/veydanproject/Veydan-Call/main/deploy/docker-compose.yml
 echo "VCALL_PUBLIC_IP=<your-ip>" > .env
 docker compose up -d
 ```
 
-(`deploy/docker-compose.yml`: the image, the volume, host networking, the
-Veydan registry and every setting as a comment; or the one command
-`docker run -d --name vcall --restart=unless-stopped --network=host -v
-vcall:/data -e VCALL_PUBLIC_IP=<your-ip> -e
-VCALL_REGISTRY=https://eu-1-vpush.veydan.net/vlink rookbeam/vcall`.)
+The image is built for amd64 and arm64 and listens on 443. Open at your
+provider: **443/tcp**, **3478/udp**, **3478/tcp**, **3479/udp**,
+**3479/tcp**, and the relay ports **49152–65535/udp** (or the range
+`VCALL_RELAY_PORTS` names). Where 443 is taken by a web server, move the
+node: `-e VCALL_LISTEN=0.0.0.0:8443`. The address the app is given comes
+from the node itself, so nothing else changes.
 
-Or the binary as a service: `deploy/vcall.service`, the binary in
-`/opt/vcall/bin/vcall`, the key and the other files of `VCALL_DATA` in
-`/opt/vcall/data`, settings in `/opt/vcall/etc/vcall.env`.
+## What happens after the install
 
-Open in the firewall: **443/tcp**, **3478/udp**, **3478/tcp**,
-**3479/udp**, **3479/tcp** (the SFU), and the relay ports
-**49152–65535/udp** (or the range `VCALL_RELAY_PORTS` names).
+Nothing more is asked of you. In order:
 
-The node makes its own key on the first start. Its reference, which the
-app takes, is what `vcall id --addr <your-ip>:443` prints:
-`<ip>:443#<id>`. Check it from another machine with
-`vcall probe <ip>:443#<id>` (and `--transport tcp`, `--transport tls`),
-and the rooms with `vcall room-test <ip>:443#<id>`.
+1. On its first start the node makes its own key. The key *is* the node:
+   its id is in the reference, `<ip>:<port>#<id>`, which
+   `vcall id --addr <your-ip>:<port>` prints.
+2. It tells the registry of the Veydan network that it exists and how full
+   it is, and says so again every five minutes.
+3. The registry checks that the node answers at its address, with its key,
+   and lists of what it can do only what that check showed.
+4. The network may hold a new node until its owner approves it.
+5. After ten minutes without a failed check the node is given to the apps.
+   They choose the nearest nodes that are not full.
 
-Where 443 is taken by a web server, move the node: `VCALL_LISTEN=0.0.0.0:8443`.
-The address the app is given comes from the node itself, so nothing else
-changes.
+To see where your node is:
 
-A public node is listed for everybody once it names the registry
-(`VCALL_REGISTRY=https://<registry host>/vlink`, and `VCALL_REGION=eu` or
-the like as a hint). It reports every five minutes how full it is; the
-registry checks that it answers before listing it, and lists of what it
-can do only what its own answer to that check says. Clients take the list
-from `GET <VCALL_REGISTRY>/v1/calls`, nodes from `/v1/calls/all` (trust,
-below). A registry older than 2026-10-09 refuses the report of this
-version (a 403 in the log). A private node is never listed; it gets its
-callers by invitation (below).
+```sh
+journalctl -u vcall -f          # a service
+docker logs -f vcall            # docker
+```
+
+| The log says | It means |
+|---|---|
+| `node is up` | it runs and listens |
+| `registry knows this node state=new` | reported; the registry has not checked it yet |
+| `… state=verified` | it answers; waiting for approval or for the ten minutes to pass |
+| `… state=active` | given to apps: it works |
+| `registry was not told … 403` | the registry refused the report: the address is not public, or the node is older than the registry takes |
+| `registry was not told`, another error | this server cannot reach the registry; it tries again by itself |
+
+Check it from **another** machine, outside its network:
+`vcall probe <ip>:<port>#<id>` (and `--transport tcp`, `--transport tls`),
+and the rooms with `vcall room-test <ip>:<port>#<id>`. What it carries
+now: `vcall ctl --socket /run/vcall/ctl.sock stats` on the server.
+
+A private node (`VCALL_PRIVATE=true`) is never listed; it gets its callers
+by invitation (below). Clients take the list of public nodes from
+`GET <VCALL_REGISTRY>/v1/calls`, nodes from `/v1/calls/all` (trust, below).
+
+## Update, move, remove
+
+- **Update.** A service: the same install command again; it replaces the
+  program when a newer release is out and keeps the key and the settings.
+  Docker: `docker pull rookbeam/vcall`, then remove the container and run
+  it again (`docker compose pull && docker compose up -d`).
+- **Move to another server.** Copy `/opt/vcall/data` (or the volume) and
+  install there. The id stays; at a new address the registry checks the
+  node again, and a network that approves by hand approves it again.
+- **Remove.** A service:
+  `systemctl disable --now vcall && rm /etc/systemd/system/vcall.service && rm -rf /opt/vcall && userdel vcall`.
+  Docker: `docker rm -f vcall && docker volume rm vcall`. The registry
+  forgets a node that went silent by itself.
 
 ## Settings
 
@@ -190,6 +311,25 @@ other node gets back nothing of its own. Try two nodes with
 `vcall cascade-test <home ip>:443#<id> <own ip>:443#<id>`. A private node
 of your own takes joins with a home from its key holders and invited
 devices only; a public one counts them per address.
+
+## Project monitoring (optional)
+
+The image carries a second, small program: the agent of the project's
+monitoring. It is off unless you turn it on with `-e VEYDAN_AGENT=on` (or
+`VEYDAN_AGENT: "on"` under `environment:` in `docker-compose.yml`). Once
+on, it sends a short report every five minutes to the project's servers,
+signed with the node's own key (`node.key` in `/data`): the node's
+kind, version and uptime, the CPU and memory of the container, its last
+errors (no address of anyone in them), and the results of the checks it
+was asked for. Those checks are only ever two: carrying test bytes
+through a bridge of the project, and asking a relay of the project for
+nothing; the agent refuses any target that is not in the project's signed
+lists. That shows the project how its network looks from where you are.
+It reports nothing about the server beyond the container, nothing about
+who uses the node, and never sees
+anyone's messages, files or calls. It opens no port: it only sends out, so
+your firewall and NAT stay as they are. To turn it off, remove the variable
+and start the container again; the node works the same either way.
 
 ## What it does and does not see
 
