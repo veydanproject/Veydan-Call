@@ -368,6 +368,13 @@ impl Server {
             // The same request again (a lost answer): the same answer. Any
             // other request on a 5-tuple that has an allocation: 437.
             if a.txid == m.txid {
+                // Under the key that made it, or not at all: the transaction id
+                // is no secret on the path, and what the answer carries (the
+                // lifetime) is the asker's word.
+                if !d.has_integrity() || !d.verify_integrity(&a.key) {
+                    self.shared.counters.refused_bad_credentials.bump();
+                    return self.challenge(key, m, 401, "Unauthorized");
+                }
                 let lifetime = self.lifetime_of(m);
                 return self.allocate_success(&a, m, lifetime);
             }

@@ -50,7 +50,7 @@ use str0m::media::{Direction, KeyframeRequest, KeyframeRequestKind, MediaKind, M
 use str0m::net::{Protocol, Receive, TcpType};
 use str0m::rtp::{ExtensionValues, RtpPacket, RtpWrite, SeqNo, Ssrc};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use vcall_proto::rooms::{ctl, Delegated, JoinRequest, Joined, LeaveRequest, TokenChanged};
 
 use super::sdp;
@@ -164,7 +164,7 @@ pub(crate) enum RoomInput {
     Gone { proto: Protocol, source: SocketAddr },
     /// A satellite: an uplink to drive, answered by the home already;
     /// `ready` is told when its `ctl` opens, or when it fails.
-    Uplink { uplink: Box<Uplink>, ready: oneshot::Sender<Result<(), String>> },
+    Uplink { uplink: Box<Uplink>, ready: oneshot::Sender<Result<(), String>>, reservation: Option<UplinkReservation> },
     /// A satellite: the uplink of `seat` is not wanted after all.
     DropUplink { seat: u32 },
     /// A satellite: the seat whose uplink is up takes its place; `others`
@@ -178,7 +178,58 @@ pub(crate) enum RoomInput {
     Vanish,
 }
 
-pub(crate) type RoomSender = mpsc::Sender<RoomInput>;
+/// The place of an uplink on its way to a room: counted against the quota
+/// from the moment the node lets it in, and given back when the room's task
+/// has it (and counts it itself) or the message is dropped.
+pub(crate) struct UplinkReservation(pub(super) Arc<Shared>);
+
+impl Drop for UplinkReservation {
+    fn drop(&mut self) {
+        self.0.uplinks_pending.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The way into the task of a room. Packets go in with `try_send` and are
+/// dropped when the queue is full; the requests of the control (join, leave,
+/// token) wait for a place instead, and so could fill the queue and push the
+/// media of the room out. They may take a quarter of it at the most: past
+/// that they wait outside the queue, and the rest is the media's.
+#[derive(Clone)]
+pub(crate) struct RoomSender {
+    tx: mpsc::Sender<RoomInput>,
+    control: Arc<Semaphore>,
+}
+
+/// The queue is full or the room is gone: the input is dropped.
+#[derive(Debug)]
+pub(crate) enum NotQueued {
+    Full,
+    Closed,
+}
+
+impl RoomSender {
+    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<RoomInput>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Self { tx, control: Arc::new(Semaphore::new((capacity / 4).max(1))) }, rx)
+    }
+
+    pub fn try_send(&self, input: RoomInput) -> Result<(), NotQueued> {
+        self.tx.try_send(input).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => NotQueued::Full,
+            mpsc::error::TrySendError::Closed(_) => NotQueued::Closed,
+        })
+    }
+
+    /// A request of the control, and the room's answer to it.
+    pub async fn ask<T>(&self, make: impl FnOnce(oneshot::Sender<Result<T, RoomError>>) -> RoomInput) -> Result<T, RoomError> {
+        // Held until the answer: that many requests are in the queue or
+        // being answered, and no more.
+        let _place = self.control.acquire().await.map_err(|_| RoomError::NotFound)?;
+        let (reply, answer) = oneshot::channel();
+        self.tx.send(make(reply)).await.map_err(|_| RoomError::NotFound)?;
+        answer.await.map_err(|_| RoomError::NotFound)?
+    }
+}
 
 /// Bits a second of one stream: the last full window, smoothed with the
 /// ones before.
@@ -765,7 +816,11 @@ impl Room {
                     p.addrs.retain(|a| *a != (proto, source));
                 }
             }
-            RoomInput::Uplink { uplink, ready } => self.add_uplink(*uplink, ready),
+            RoomInput::Uplink { uplink, ready, reservation } => {
+                self.add_uplink(*uplink, ready);
+                // Counted in `uplinks_now` by now: the reservation is dropped after.
+                drop(reservation);
+            }
             RoomInput::DropUplink { seat } => {
                 if let Some(u) = self.uplinks.iter().position(|u| u.seat == seat) {
                     self.close_uplink(u);
@@ -870,13 +925,11 @@ impl Room {
             self.shared.counters.cascade_joins_refused_list.bump();
             return Err(RoomError::CascadeRefused("this node takes no seats of that node".into()));
         }
-        let quota = self.shared.config.cascade_seats_per_node;
-        if quota > 0 && !listed {
-            let seats = self.shared.node_seats.lock().expect("node seats").get(&word.node).copied().unwrap_or(0);
-            if seats >= quota {
-                self.shared.counters.cascade_joins_refused_quota.bump();
-                return Err(RoomError::CascadeRefused("the node holds as many seats here as it may".into()));
-            }
+        // Counted at once, with the check: the seat is given back if the join
+        // does not come to a seat.
+        if !self.shared.reserve_node_seat(&word.node, listed) {
+            self.shared.counters.cascade_joins_refused_quota.bump();
+            return Err(RoomError::CascadeRefused("the node holds as many seats here as it may".into()));
         }
         Ok(word.node.clone())
     }
@@ -915,18 +968,29 @@ impl Room {
                 None
             }
         };
+        let release = |room: &Self| {
+            if let Some(node) = &uplink {
+                room.shared.release_node_seat(node);
+            }
+        };
         if self.participants.len() >= self.max_participants as usize {
+            release(self);
             self.shared.counters.joins_refused_full.bump();
             return Err(RoomError::Full);
         }
-        let (id, token, answer) = self.seat(None, &request)?;
+        let (id, token, answer) = match self.seat(None, &request) {
+            Ok(seat) => seat,
+            Err(e) => {
+                release(self);
+                return Err(e);
+            }
+        };
         if let Some(pass) = pass {
             self.proxy_tokens.remove(pass);
         }
         if let Some(node) = &uplink {
             self.shared.proxy_seats_now.fetch_add(1, Ordering::Relaxed);
             self.shared.counters.cascade_seats_joined.bump();
-            *self.shared.node_seats.lock().expect("node seats").entry(node.clone()).or_insert(0) += 1;
             if let Some(p) = self.participants.iter_mut().find(|p| p.id == id) {
                 p.uplink = uplink.clone();
             }
@@ -1041,7 +1105,9 @@ impl Room {
     /// room but one, or, in a satellite, the home's roster but one.
     fn egress_seats(&self) -> u32 {
         match self.home {
-            Some(_) => (self.roster.len() as u32).saturating_sub(1).max(1),
+            // Bounded by this node's own seats a room: what the home
+            // says cannot raise it.
+            Some(_) => (self.roster.len() as u32).min(self.shared.config.max_participants).saturating_sub(1).max(1),
             None => self.max_participants.saturating_sub(1).max(1),
         }
     }
@@ -1129,13 +1195,7 @@ impl Room {
         self.shared.counters.participants_left.bump();
         if let Some(node) = &p.uplink {
             self.shared.proxy_seats_now.fetch_sub(1, Ordering::Relaxed);
-            let mut seats = self.shared.node_seats.lock().expect("node seats");
-            if let Some(n) = seats.get_mut(node) {
-                *n = n.saturating_sub(1);
-                if *n == 0 {
-                    seats.remove(node);
-                }
-            }
+            self.shared.release_node_seat(node);
         }
         // The streams it sent are stopped at everybody else's.
         let origin = Origin::Client(id);
@@ -1431,13 +1491,24 @@ impl Room {
             self.relay(i, &data.data);
             return;
         }
+        // The pace is the same as for the bytes: a text frame is parsed, and a
+        // layer request plans the layers of the participant.
+        if !self.ctl_allowed(i) {
+            self.shared.counters.sfu_ctl_dropped.bump();
+            return;
+        }
         match serde_json::from_slice::<ctl::Message>(&data.data) {
             Ok(ctl::Message::Answer { seq, sdp }) => self.answer(i, seq, &sdp),
             Ok(ctl::Message::Layer { participant, rid }) => self.layer_request(i, participant, rid, Instant::now()),
             Ok(_) | Err(_) => {
-                tracing::debug!(room = %self.id, participant = p.id, "a text frame that is no answer");
+                tracing::debug!(room = %self.id, participant = self.participants[i].id, "a text frame that is no answer");
             }
         }
+    }
+
+    /// Whether participant `i` may send one more frame on `ctl` now.
+    fn ctl_allowed(&self, i: usize) -> bool {
+        self.participants[i].ctl_rate.take(1)
     }
 
     /// The answer to the offer `seq`; to any other, or when none is out,
@@ -2104,7 +2175,12 @@ impl Room {
                 }
                 if data.binary {
                     // Bytes of a participant at the home, the sender in
-                    // front already: to the seat, and to it alone.
+                    // front already: to the seat, and to it alone. Of the
+                    // size and the pace a participant's are.
+                    if data.data.len() > ctl::MAX_FRAME + ctl::FROM_LEN || !self.uplinks[u].ctl_rate.take(1) {
+                        self.shared.counters.sfu_ctl_dropped.bump();
+                        return;
+                    }
                     let seat = self.uplinks[u].seat;
                     if let Some(p) = self.participants.iter_mut().find(|p| p.id == seat) {
                         if let Some(cid) = p.ctl {
@@ -2174,10 +2250,17 @@ impl Room {
                     self.roster_remove(id);
                 }
                 for id in all {
-                    self.roster_add(id, false);
+                    if !self.roster_add(id, false) {
+                        self.uplink_over_cap(u);
+                        break;
+                    }
                 }
             }
-            ctl::Message::Joined { id } => self.roster_add(id, false),
+            ctl::Message::Joined { id } => {
+                if !self.roster_add(id, false) {
+                    self.uplink_over_cap(u);
+                }
+            }
             ctl::Message::Left { id } => self.roster_remove(id),
             ctl::Message::Speaking { participants } => {
                 if participants != self.speakers {
@@ -2204,6 +2287,15 @@ impl Room {
     fn home_offer(&mut self, u: usize, seq: u32, sdp: &str, tracks: Vec<ctl::Track>) {
         let seat = self.uplinks[u].seat;
         let stopped: Vec<Mid> = sdp::stopped_mids(sdp).into_iter().map(|m| Mid::from(m.as_str())).collect();
+        // The home's offer is bounded by this node's room: a stream of
+        // each of the others, so many m-lines and no more.
+        let media_lines = sdp::media_lines(sdp);
+        let most = MAX_RX_TRACKS * self.roster_cap().saturating_sub(1).max(1);
+        if media_lines > most {
+            tracing::debug!(room = %self.id, seat, media_lines, most, "the home's offer has more m-lines than this node's room holds");
+            self.uplink_over_cap(u);
+            return;
+        }
         let answer = {
             let uplink = &mut self.uplinks[u];
             let offer = match SdpOffer::from_sdp_string(sdp) {
@@ -2361,7 +2453,7 @@ impl Room {
             self.remove(seat);
             self.uplinks.push(fresh);
         }
-        for other in others {
+        for other in others.iter().take(self.roster_cap()) {
             if *other != seat {
                 self.roster_add(*other, false);
             }
@@ -2374,9 +2466,15 @@ impl Room {
 
     /// `id` is in the home's room: the seats here are told when that is
     /// news. `own`: the seat is one of this node's, joining now.
-    fn roster_add(&mut self, id: u32, own: bool) {
+    /// False when the home's roster is past what this node's room holds
+    /// (`max_participants` of its own, not the home's): the id is not
+    /// taken, and the caller drops the uplink, the seat goes to the home.
+    fn roster_add(&mut self, id: u32, own: bool) -> bool {
         if self.roster.contains(&id) {
-            return;
+            return true;
+        }
+        if !own && self.is_satellite() && self.roster.len() >= self.roster_cap() {
+            return false;
         }
         self.roster.push(id);
         self.roster.sort_unstable();
@@ -2386,6 +2484,20 @@ impl Room {
         if own {
             tracing::trace!(room = %self.id, seat = id, "a seat of ours in the roster");
         }
+        true
+    }
+
+    /// The most of the home's room this node holds: its own limit of seats.
+    fn roster_cap(&self) -> usize {
+        self.shared.config.max_participants as usize
+    }
+
+    /// The home's room is past what this node holds: the uplink is given
+    /// up, and the seat comes to the home by the usual rules.
+    fn uplink_over_cap(&mut self, u: usize) {
+        tracing::debug!(room = %self.id, seat = self.uplinks[u].seat, cap = self.roster_cap(), "the home's room is past this node's limit");
+        self.uplinks[u].lost = true;
+        self.uplinks[u].rtc.disconnect();
     }
 
     fn roster_remove(&mut self, id: u32) {
@@ -2818,11 +2930,12 @@ mod tests {
             participants_now: std::sync::atomic::AtomicUsize::new(0),
             satellites_now: std::sync::atomic::AtomicUsize::new(0),
             uplinks_now: std::sync::atomic::AtomicUsize::new(0),
+            uplinks_pending: std::sync::atomic::AtomicUsize::new(0),
             proxy_seats_now: std::sync::atomic::AtomicUsize::new(0),
             node_seats: std::sync::Mutex::new(HashMap::new()),
             reach: super::super::ReachCache::default(),
         });
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = RoomSender::channel(16);
         Room::new("bench".into(), shared, tx, rx, "join".into(), "admin".into(), 8, 0, Duration::from_secs(60))
     }
 
@@ -3043,6 +3156,82 @@ mod tests {
         assert_eq!(asked(&room, 1, 2), Some(t0 + Duration::from_millis(1000)));
     }
 
+    /// The quotas of the cascade are taken in one step with their check:
+    /// asked by many at once, no more than the quota gets through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_quotas_of_the_cascade_hold_when_asked_at_once() {
+        let room = bench(3, 2500).await;
+        let shared = room.shared.clone();
+        let (mut seats, mut uplinks) = (0, 0);
+        let tries: Vec<_> = (0..(shared.config.cascade_uplinks + 256).max(512))
+            .map(|_| {
+                let shared = shared.clone();
+                std::thread::spawn(move || (shared.reserve_node_seat("node", false), shared.reserve_uplink()))
+            })
+            .collect();
+        let mut held = Vec::new();
+        for t in tries {
+            let (seat, uplink) = t.join().unwrap();
+            seats += usize::from(seat);
+            if let Some(uplink) = uplink {
+                uplinks += 1;
+                held.push(uplink);
+            }
+        }
+        assert_eq!(seats, shared.config.cascade_seats_per_node as usize, "seats of one node");
+        assert_eq!(uplinks, shared.config.cascade_uplinks, "uplinks of the node");
+        // A place is given back when its reservation goes, and a seat when released.
+        drop(held);
+        assert!(shared.reserve_uplink().is_some());
+        shared.release_node_seat("node");
+        assert!(shared.reserve_node_seat("node", false));
+        assert!(shared.reserve_node_seat("node", true), "a node of the list has no quota");
+    }
+
+    /// The requests of the control take a quarter of the queue of a room at
+    /// the most, however many wait: the rest is for the media.
+    #[tokio::test]
+    async fn the_control_takes_a_quarter_of_the_queue_of_a_room() {
+        let (tx, mut rx) = RoomSender::channel(8);
+        let asks: Vec<_> = (0..6)
+            .map(|_| {
+                let tx = tx.clone();
+                tokio::spawn(async move { tx.ask(|reply| RoomInput::Token { admin_token: "x".into(), reply }).await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let queued = 8 - tx.tx.capacity();
+        assert_eq!(queued, 2, "two of eight places for six requests");
+        // The media has the rest of the places.
+        for _ in 0..6 {
+            tx.try_send(RoomInput::HomeLost).unwrap();
+        }
+        assert!(tx.try_send(RoomInput::HomeLost).is_err());
+        // A request answered gives its place to the next.
+        let Some(RoomInput::Token { reply, .. }) = rx.recv().await else { panic!("a token request first") };
+        let _ = reply.send(Err(RoomError::BadToken));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(asks.iter().any(|a| a.is_finished()));
+    }
+
+    /// Text frames of a participant come at the pace of its bytes: the
+    /// answer and the layer requests are few, and a flood of them is not
+    /// parsed.
+    #[tokio::test]
+    async fn the_text_frames_of_a_participant_have_a_pace() {
+        let t0 = Instant::now();
+        let mut room = bench(3, 2500).await;
+        seat(&mut room, 1, t0);
+        seat(&mut room, 2, t0);
+        let (a, b) = (at(&room, 1), at(&room, 2));
+        room.participants[a].ctl_rate = Bucket::new(u64::from(ctl::MAX_FRAMES_PER_SEC));
+        let taken = (0..200).filter(|_| room.ctl_allowed(a)).count();
+        assert!((1..=ctl::MAX_FRAMES_PER_SEC as usize + 2).contains(&taken), "{taken} frames in a burst");
+        // Each participant has a pace of its own.
+        room.participants[b].ctl_rate = Bucket::new(u64::from(ctl::MAX_FRAMES_PER_SEC));
+        assert!(room.ctl_allowed(b));
+    }
+
     #[tokio::test]
     async fn a_plan_back_to_the_current_layer_calls_the_move_off() {
         let t0 = Instant::now() + Duration::from_secs(60);
@@ -3154,7 +3343,7 @@ mod satellite_tests {
     async fn a_satellite_ending_takes_a_join_queued_that_moment_or_leaves_the_table() {
         let mut room = satellite(0).await;
         let (ready, mut told) = oneshot::channel();
-        room.tx.try_send(RoomInput::Uplink { uplink: Box::new(uplink_on_loopback(2, 0).await), ready }).unwrap();
+        room.tx.try_send(RoomInput::Uplink { uplink: Box::new(uplink_on_loopback(2, 0).await), ready, reservation: None }).unwrap();
         assert!(!room.settle(), "the uplink queued keeps the satellite");
         assert_eq!(room.uplinks.len(), 1);
         assert!(in_table(&room) && !room.removed && !room.ending);
@@ -3183,7 +3372,7 @@ mod satellite_tests {
         assert!(in_table(&room) && !room.ending);
         room.uplinks.clear();
         let (ready, mut told) = oneshot::channel();
-        room.tx.try_send(RoomInput::Uplink { uplink: Box::new(uplink_on_loopback(3, 0).await), ready }).unwrap();
+        room.tx.try_send(RoomInput::Uplink { uplink: Box::new(uplink_on_loopback(3, 0).await), ready, reservation: None }).unwrap();
         assert!(!room.idle_out(now), "the uplink queued that moment keeps it");
         assert_eq!(room.uplinks.len(), 1);
         assert!(in_table(&room) && !room.ending);
@@ -3216,6 +3405,71 @@ mod satellite_tests {
         room.kbps_per_participant = 0;
         room.refresh_egress();
         assert_eq!(room.uplinks[0].ingress.bytes_per_sec(), 0);
+    }
+
+    /// The home's roster cannot raise what this node holds: its own limit
+    /// of seats a room (8 on the bench) caps the roster, and the bucket of
+    /// an uplink with it, whatever the home says.
+    #[tokio::test]
+    async fn the_roster_of_a_satellite_is_capped_by_its_own_limit() {
+        let mut room = satellite(64).await;
+        let (ready, _told) = oneshot::channel();
+        room.add_uplink(uplink_on_loopback(2, 64).await, ready);
+        for id in 1..=8 {
+            assert!(room.roster_add(id, false), "{id} fits");
+        }
+        assert!(!room.uplinks[0].lost);
+        assert_eq!(room.uplinks[0].ingress.bytes_per_sec(), 7 * 8000);
+        // A roster of a thousand set from outside is sized by the cap.
+        room.roster = (1..=1000).collect();
+        room.refresh_egress();
+        assert_eq!(room.egress_seats(), 7);
+        assert_eq!(room.uplinks[0].ingress.bytes_per_sec(), 7 * 8000, "not above kbps x (room max - 1)");
+        assert_eq!(room.participants.len(), 0);
+    }
+
+    /// One `joined` past the cap drops the uplink: the seat goes to the home.
+    #[tokio::test]
+    async fn a_joined_past_the_cap_loses_the_uplink() {
+        let mut room = satellite(64).await;
+        let (ready, _told) = oneshot::channel();
+        room.add_uplink(uplink_on_loopback(2, 64).await, ready);
+        for id in 1..=8 {
+            room.home_message(0, ctl::Message::Joined { id });
+        }
+        assert!(!room.uplinks[0].lost, "eight are held");
+        assert_eq!(room.roster.len(), 8);
+        room.home_message(0, ctl::Message::Joined { id: 9 });
+        assert!(room.uplinks[0].lost, "the ninth is past the limit");
+        assert_eq!(room.roster.len(), 8, "and is not taken");
+    }
+
+    /// An offer of the home with more m-lines than the others of this node's
+    /// room can have is refused before it is read, and the uplink is lost.
+    #[tokio::test]
+    async fn an_offer_with_too_many_m_lines_is_refused() {
+        let mut room = satellite(64).await;
+        let (ready, _told) = oneshot::channel();
+        room.add_uplink(uplink_on_loopback(2, 64).await, ready);
+        let most = MAX_RX_TRACKS * 7;
+        let offer = |n: usize| (0..n).map(|i| format!("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:{i}\r\n")).collect::<String>();
+        room.home_message(0, ctl::Message::Offer { seq: 1, sdp: offer(most + 1), tracks: vec![] });
+        assert!(room.uplinks[0].lost);
+        assert!(room.uplinks[0].rx.is_empty());
+    }
+
+    /// The bytes of the home on `ctl` come at the pace of a participant's.
+    #[tokio::test]
+    async fn the_frames_of_the_home_have_a_pace() {
+        let room = {
+            let mut room = satellite(64).await;
+            let (ready, _told) = oneshot::channel();
+            room.add_uplink(uplink_on_loopback(2, 64).await, ready);
+            room
+        };
+        let taken = (0..200).filter(|_| room.uplinks[0].ctl_rate.take(1)).count();
+        assert!(taken <= ctl::MAX_FRAMES_PER_SEC as usize + 2, "{taken} frames in a burst");
+        assert!(taken >= 1);
     }
 
     /// A seat is told of the others as the home's join answered, before

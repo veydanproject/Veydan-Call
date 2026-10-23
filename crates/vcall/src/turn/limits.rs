@@ -101,6 +101,13 @@ impl RateWindow {
         Self { window, max, seen: Mutex::new(HashMap::new()) }
     }
 
+    /// Whether the address has used up the allowance of the window already;
+    /// nothing is counted.
+    pub fn exhausted(&self, ip: IpAddr) -> bool {
+        let seen = self.seen.lock().expect("rate");
+        seen.get(&ip).is_some_and(|(start, n)| start.elapsed() < self.window && *n >= self.max)
+    }
+
     /// Counts one more and says whether it is within the allowance.
     pub fn allow(&self, ip: IpAddr) -> bool {
         let now = Instant::now();

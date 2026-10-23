@@ -386,6 +386,7 @@ impl Node {
                 room_idle_secs: sfu.config().idle.as_secs() as u32,
             },
             rate: RateWindow::new(CREDENTIALS_WINDOW, config.credentials_per_ip),
+            bad_tokens: RateWindow::new(control::BAD_TOKENS_WINDOW, control::BAD_TOKENS_PER_IP),
             counters: counters.clone(),
             sfu: sfu.clone(),
             cascade,

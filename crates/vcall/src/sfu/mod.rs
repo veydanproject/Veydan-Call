@@ -296,6 +296,9 @@ pub struct Shared {
     satellites_now: AtomicUsize,
     /// Uplinks this node holds to homes, and seats other nodes hold here.
     uplinks_now: AtomicUsize,
+    /// Uplinks that were let in (`take_uplink`) and are not yet counted in
+    /// `uplinks_now`: on their way to the task of a room.
+    uplinks_pending: AtomicUsize,
     proxy_seats_now: AtomicUsize,
     /// Seats each other node holds here, by its id: the quota.
     node_seats: Mutex<HashMap<String, u32>>,
@@ -308,6 +311,41 @@ pub struct Sfu {
 }
 
 impl Shared {
+    /// A place for one more uplink, taken now: counted with those that are
+    /// held, so that several asking at once do not all find the last place
+    /// free. The place is given back when the reservation is dropped, which
+    /// is when the room's task has taken the uplink or the message is lost.
+    fn reserve_uplink(self: &Arc<Self>) -> Option<room::UplinkReservation> {
+        let ahead = self.uplinks_pending.fetch_add(1, Ordering::SeqCst);
+        let reservation = room::UplinkReservation(self.clone());
+        (self.uplinks_now.load(Ordering::SeqCst) + ahead < self.config.cascade_uplinks).then_some(reservation)
+    }
+
+    /// A seat of `node` here, counted at once if the node is under its
+    /// quota (`listed`: the node of the trust list has none), and not
+    /// otherwise. The check and the count are one step: rooms are tasks of
+    /// their own, and two of them taking the last seat of a node would
+    /// otherwise both find it free.
+    fn reserve_node_seat(&self, node: &str, listed: bool) -> bool {
+        let quota = self.config.cascade_seats_per_node;
+        let mut seats = self.node_seats.lock().expect("node seats");
+        if quota > 0 && !listed && seats.get(node).copied().unwrap_or(0) >= quota {
+            return false;
+        }
+        *seats.entry(node.to_string()).or_insert(0) += 1;
+        true
+    }
+
+    /// The seat of `node` is not held any more.
+    fn release_node_seat(&self, node: &str) {
+        let mut seats = self.node_seats.lock().expect("node seats");
+        if let Some(n) = seats.get_mut(node) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                seats.remove(node);
+            }
+        }
+    }
     /// An `Rtc` for one participant: ICE-lite (the node has a public
     /// address, the client does the checking), RTP mode (packets as they
     /// are), the codecs of [`CODECS`], and an estimate of the bandwidth
@@ -423,6 +461,7 @@ impl Sfu {
                 participants_now: AtomicUsize::new(0),
                 satellites_now: AtomicUsize::new(0),
                 uplinks_now: AtomicUsize::new(0),
+                uplinks_pending: AtomicUsize::new(0),
                 proxy_seats_now: AtomicUsize::new(0),
                 node_seats: Mutex::new(HashMap::new()),
                 reach: ReachCache::default(),
@@ -521,7 +560,7 @@ impl Sfu {
     pub fn create_room(&self, limits: &MediaLimits) -> Result<RoomCreated, RoomError> {
         let shared = &self.shared;
         let config = &shared.config;
-        let (tx, rx) = mpsc::channel(ROOM_QUEUE);
+        let (tx, rx) = RoomSender::channel(ROOM_QUEUE);
         let id = hex(&random(16));
         {
             let mut rooms = shared.rooms.lock().expect("rooms");
@@ -579,9 +618,7 @@ impl Sfu {
     }
 
     async fn ask_room<T>(room: RoomSender, make: impl FnOnce(oneshot::Sender<Result<T, RoomError>>) -> RoomInput) -> Result<T, RoomError> {
-        let (reply, answer) = oneshot::channel();
-        room.send(make(reply)).await.map_err(|_| RoomError::NotFound)?;
-        answer.await.map_err(|_| RoomError::NotFound)?
+        room.ask(make).await
     }
 
     async fn ask<T>(&self, id: &str, make: impl FnOnce(oneshot::Sender<Result<T, RoomError>>) -> RoomInput) -> Result<T, RoomError> {
@@ -641,7 +678,7 @@ impl Sfu {
                     shared.counters.rooms_refused_quota.bump();
                     return Err(RoomError::CascadeRefused("the node holds as many rooms as it may".into()));
                 }
-                let (tx, rx) = mpsc::channel(ROOM_QUEUE);
+                let (tx, rx) = RoomSender::channel(ROOM_QUEUE);
                 satellites.insert(key, tx.clone());
                 shared.satellites_now.fetch_add(1, Ordering::Relaxed);
                 shared.counters.satellites_made.bump();
@@ -658,11 +695,11 @@ impl Sfu {
     /// satellite to drive. The satellite says when the uplink is up (its
     /// `ctl` open) or gone, over `ready`.
     pub fn take_uplink(&self, home: &Home, room_id: &str, uplink: Uplink, ready: oneshot::Sender<Result<(), String>>) -> Result<(), RoomError> {
-        if self.shared.uplinks_now.load(Ordering::Relaxed) >= self.shared.config.cascade_uplinks {
+        let Some(reservation) = self.shared.reserve_uplink() else {
             self.shared.counters.cascade_joins_refused.bump();
             return Err(RoomError::CascadeRefused("the node holds as many uplinks as it may".into()));
-        }
-        self.send_to_satellite(home, room_id, RoomInput::Uplink { uplink: Box::new(uplink), ready })
+        };
+        self.send_to_satellite(home, room_id, RoomInput::Uplink { uplink: Box::new(uplink), ready, reservation: Some(reservation) })
     }
 
     /// The seat `seat` of the satellite of `home` for `room_id`, for the

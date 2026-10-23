@@ -41,6 +41,12 @@ const MAX_STREAMS: u32 = 16;
 pub const INVITE_ATTEMPTS_PER_IP: u32 = 10;
 pub const INVITE_WINDOW: Duration = Duration::from_secs(3600);
 
+/// Tokens of rooms (join, admin) that may be wrong, from one address in a
+/// window. The id of a room is no secret to whoever was in it, and every
+/// try costs the room's task a turn; past this the address is told to wait.
+pub const BAD_TOKENS_PER_IP: u32 = 20;
+pub const BAD_TOKENS_WINDOW: Duration = Duration::from_secs(60);
+
 pub struct Control {
     pub node_id: NodeId,
     pub version: String,
@@ -67,6 +73,8 @@ pub struct Control {
     pub limits: Limits,
     /// Credentials and rooms per address and window, on a public node.
     pub rate: RateWindow,
+    /// Wrong tokens of rooms per address and window.
+    pub bad_tokens: RateWindow,
     pub counters: Arc<Counters>,
     pub sfu: Arc<Sfu>,
     /// Joins with a home: this node as the participant's own.
@@ -172,10 +180,45 @@ impl Control {
     /// A join: of a room here, or, with a home named, of a room elsewhere
     /// through this node.
     pub async fn join(&self, id: &str, request: JoinRequest, peer: IpAddr) -> Result<rooms::Joined, Refused> {
-        if request.home.is_some() {
-            return self.cascade.join_via_home(id, request, peer).await.map_err(crate::cascade::refused);
+        self.not_guessing(peer)?;
+        let joined = if request.home.is_some() {
+            self.cascade.join_via_home(id, request, peer).await.map_err(crate::cascade::refused)
+        } else {
+            self.sfu.join(id, request).await.map_err(Refused::from)
+        };
+        self.noted(peer, joined)
+    }
+
+    /// Leaving a room: the participant's token is the proof.
+    pub async fn leave(&self, id: &str, request: LeaveRequest, peer: IpAddr) -> Result<serde_json::Value, Refused> {
+        self.not_guessing(peer)?;
+        let left = self.sfu.leave(id, request).await.map(|()| serde_json::json!({})).map_err(Refused::from);
+        self.noted(peer, left)
+    }
+
+    /// A new join token, by the admin token.
+    pub async fn change_token(&self, id: &str, request: TokenRequest, peer: IpAddr) -> Result<rooms::TokenChanged, Refused> {
+        self.not_guessing(peer)?;
+        let changed = self.sfu.change_token(id, request.admin_token).await.map_err(Refused::from);
+        self.noted(peer, changed)
+    }
+
+    /// An address that was wrong about tokens too often is not answered
+    /// until its window is over, whatever it brings.
+    fn not_guessing(&self, peer: IpAddr) -> Result<(), Refused> {
+        if self.bad_tokens.exhausted(peer) {
+            self.counters.credentials_refused_rate.bump();
+            return Err((StatusCode::TOO_MANY_REQUESTS, Refusal::new(refusal::RATE_LIMITED, "too many wrong tokens from this address")));
         }
-        self.sfu.join(id, request).await.map_err(Refused::from)
+        Ok(())
+    }
+
+    /// Counts a wrong token against the address it came from.
+    fn noted<T>(&self, peer: IpAddr, result: Result<T, Refused>) -> Result<T, Refused> {
+        if matches!(&result, Err((_, refusal)) if refusal.error == refusal::BAD_TOKEN) {
+            self.bad_tokens.allow(peer);
+        }
+        result
     }
 
     /// An invitation exchanged for the credentials of a device. Every
@@ -339,11 +382,11 @@ async fn answer(request: Request<RecvStream>, mut respond: SendResponse<Bytes>, 
             Err(e) => bad_request(control, e),
         },
         Route::Room(id, action::LEAVE) => match serde_json::from_slice::<LeaveRequest>(&body) {
-            Ok(request) => reply(control.sfu.leave(id, request).await.map(|()| serde_json::json!({})).map_err(Refused::from)),
+            Ok(request) => reply(control.leave(id, request, peer.ip()).await),
             Err(e) => bad_request(control, e),
         },
         Route::Room(id, action::TOKEN) => match serde_json::from_slice::<TokenRequest>(&body) {
-            Ok(request) => reply(control.sfu.change_token(id, request.admin_token).await.map_err(Refused::from)),
+            Ok(request) => reply(control.change_token(id, request, peer.ip()).await),
             Err(e) => bad_request(control, e),
         },
         Route::Room(..) => {
@@ -455,6 +498,7 @@ mod tests {
             urls: vec!["stun:203.0.113.7:3478".into()],
             limits: Limits::default(),
             rate: RateWindow::new(Duration::from_secs(60), 2),
+            bad_tokens: RateWindow::new(BAD_TOKENS_WINDOW, BAD_TOKENS_PER_IP),
             counters,
             sfu,
             cascade,
@@ -534,6 +578,34 @@ mod tests {
         // Revoked: a stranger.
         assert_eq!(c.gate.devices.revoke(&creds.device_id), Ok(true));
         assert_eq!(c.turn(&device, ip).unwrap_err().1.error, refusal::ACCESS_KEY_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn an_address_that_guesses_tokens_is_told_to_wait_and_one_that_is_right_is_not() {
+        let c = control(false).await;
+        let room = c.sfu.create_room(&Default::default()).unwrap();
+        let guesser: IpAddr = "198.51.100.1".parse().unwrap();
+        let wrong = || JoinRequest::new("not-the-token", "", vec![]);
+        for _ in 0..BAD_TOKENS_PER_IP {
+            let (status, r) = c.join(&room.room_id, wrong(), guesser).await.unwrap_err();
+            assert_eq!((status, r.error.as_str()), (StatusCode::FORBIDDEN, refusal::BAD_TOKEN));
+        }
+        // Past the allowance nothing reaches the room, whatever it is.
+        let asked_before = c.counters.joins_refused_token.load(std::sync::atomic::Ordering::Relaxed);
+        let (status, r) = c.join(&room.room_id, wrong(), guesser).await.unwrap_err();
+        assert_eq!((status, r.error.as_str()), (StatusCode::TOO_MANY_REQUESTS, refusal::RATE_LIMITED));
+        let leave = LeaveRequest { participant_id: 1, token: "x".into() };
+        assert_eq!(c.leave(&room.room_id, leave, guesser).await.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+        let token = TokenRequest { admin_token: "x".into() };
+        assert_eq!(c.change_token(&room.room_id, token, guesser).await.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(c.counters.joins_refused_token.load(std::sync::atomic::Ordering::Relaxed), asked_before);
+
+        // Another address is not touched, and the admin's own token works.
+        let friend: IpAddr = "198.51.100.2".parse().unwrap();
+        let changed = c.change_token(&room.room_id, TokenRequest { admin_token: room.admin_token.clone() }, friend).await.unwrap();
+        assert!(!changed.join_token.is_empty());
+        let (_, r) = c.change_token(&room.room_id, TokenRequest { admin_token: "x".into() }, friend).await.unwrap_err();
+        assert_eq!(r.error, refusal::BAD_TOKEN);
     }
 
     #[tokio::test]

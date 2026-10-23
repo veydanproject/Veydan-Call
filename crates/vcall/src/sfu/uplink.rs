@@ -31,11 +31,11 @@ use str0m::net::Protocol;
 use str0m::rtp::Ssrc;
 use str0m::{Candidate, Rtc};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use vcall_proto::rooms::ctl;
 
 use super::sdp::{self, MediaSection};
-use super::room::{RoomInput, RoomSender};
+use super::room::{NotQueued, RoomInput, RoomSender};
 use crate::counters::{Bump, Counters};
 use crate::turn::limits::Bucket;
 use crate::turn::policy::{PeerPolicy, Port};
@@ -102,6 +102,8 @@ pub struct Uplink {
     /// of the home's roster (the satellite sizes it as the roster goes;
     /// one share until the roster is known).
     pub ingress: Bucket,
+    /// Frames of the home on `ctl` a second: the pace of a participant's.
+    pub ctl_rate: Bucket,
     pub last_packet: Instant,
     pub made_at: Instant,
     /// Told once: the uplink is up (its `ctl` open), or it is not coming.
@@ -194,6 +196,7 @@ impl UplinkDraft {
             rx: Vec::new(),
             ssrc_mids: std::collections::HashMap::new(),
             ingress: Bucket::from_kbps(u64::from(kbps)),
+            ctl_rate: Bucket::new(u64::from(ctl::MAX_FRAMES_PER_SEC)),
             last_packet: now,
             made_at: now,
             ready: None,
@@ -233,8 +236,8 @@ impl Uplink {
                 let input = RoomInput::UplinkPacket { seat, source, at: Instant::now(), data: buf[..n].to_vec() };
                 match room.try_send(input) {
                     Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => counters.sfu_dropped_queue.bump(),
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    Err(NotQueued::Full) => counters.sfu_dropped_queue.bump(),
+                    Err(NotQueued::Closed) => break,
                 }
             }
         }));
@@ -358,7 +361,7 @@ mod tests {
     async fn a_full_room_queue_loses_a_datagram_and_not_the_reader() {
         let mut uplink = uplink_on_loopback(7, 0).await;
         let counters = Arc::new(Counters::default());
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = RoomSender::channel(1);
         tx.try_send(RoomInput::HomeLost).unwrap();
         uplink.start_reading(tx, counters.clone());
         let home = UdpSocket::bind("127.0.0.1:0").await.unwrap();

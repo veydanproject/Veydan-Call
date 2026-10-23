@@ -2418,3 +2418,62 @@ async fn an_invitation_is_exchanged_for_the_credentials_of_a_device_that_open_a_
     drop(seat);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A request that repeats the transaction of an allocation is answered
+/// only when it is signed by the key that made it: the id of a transaction
+/// is no secret to whoever sees the packets, and the answer carries the
+/// lifetime the repeater asked for.
+#[tokio::test]
+async fn a_repeated_allocate_is_answered_only_under_the_key_that_made_it() {
+    use vcall::stun::{attr, method, Class, Decoded, Message};
+
+    let node = start(config(true)).await;
+    let creds = node.credentials(Access::default()).await.unwrap();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket.connect(node.addrs.turn_udp).await.unwrap();
+    let exchange = |raw: Vec<u8>| {
+        let socket = &socket;
+        async move {
+            socket.send(&raw).await.unwrap();
+            let mut buf = [0u8; 1500];
+            let n = tokio::time::timeout(WAIT, socket.recv(&mut buf)).await.expect("an answer").unwrap();
+            Decoded::parse(&buf[..n]).unwrap().msg
+        }
+    };
+    let allocate = |lifetime: u32| {
+        let mut m = Message::request(method::ALLOCATE);
+        m.add(attr::REQUESTED_TRANSPORT, vec![vcall::stun::TRANSPORT_UDP, 0, 0, 0]).add_u32(attr::LIFETIME, lifetime);
+        m
+    };
+
+    // The challenge, then the allocation under the credentials.
+    let challenge = exchange(allocate(100).encode(None, true)).await;
+    let (realm, nonce) = (challenge.get_str(attr::REALM).unwrap().to_string(), challenge.get_str(attr::NONCE).unwrap().to_string());
+    let key = vcall::stun::long_term_key(&creds.username, &realm, &creds.password);
+    let mut first = allocate(100);
+    first.add_str(attr::USERNAME, &creds.username).add_str(attr::REALM, &realm).add_str(attr::NONCE, &nonce);
+    let signed = first.encode(Some(&key), true);
+    let made = exchange(signed.clone()).await;
+    assert_eq!(made.class, Class::Success);
+    let lifetime = made.get_u32(attr::LIFETIME).unwrap();
+
+    // The same bytes again (a lost answer): the same answer.
+    let again = exchange(signed).await;
+    assert_eq!((again.class, again.get_u32(attr::LIFETIME)), (Class::Success, Some(lifetime)));
+    assert_eq!(node.handle.turn.active(), 1);
+
+    // The transaction repeated by somebody who cannot sign it, asking for
+    // another lifetime: no success, no lifetime.
+    let mut forged = allocate(1);
+    forged.txid = first.txid;
+    let refused = exchange(forged.encode(None, true)).await;
+    assert_eq!(refused.class, Class::Error);
+    assert_eq!(refused.get_u32(attr::LIFETIME), None);
+    // ...nor under a key that is not the allocation's.
+    let mut wrong = allocate(1);
+    wrong.txid = first.txid;
+    wrong.add_str(attr::USERNAME, &creds.username).add_str(attr::REALM, &realm).add_str(attr::NONCE, &nonce);
+    let refused = exchange(wrong.encode(Some(&[7u8; 16]), true)).await;
+    assert_eq!(refused.class, Class::Error);
+    assert_eq!(node.handle.turn.active(), 1);
+}
